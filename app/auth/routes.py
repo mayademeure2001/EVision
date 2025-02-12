@@ -83,7 +83,10 @@ def login():
 @login_required
 def logout():
     logout_user()
-    return jsonify({'message': 'Logout successful'}), 200
+    # Clear the session cookie
+    response = jsonify({'message': 'Logout successful'})
+    response.set_cookie('session', '', expires=0)  # Expire the cookie immediately
+    return response, 200
 
 @bp.route('/reset-password', methods=['POST'])
 def reset_password():

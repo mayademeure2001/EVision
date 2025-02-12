@@ -92,8 +92,12 @@ def search_stations():
             'available_only': request.args.get('available_only', type=bool)
         }
 
-        stations = BigQueryDatabase.search_stations(search_params)
-        return jsonify({'stations': stations}), 200
+        stations = db.search_stations(search_params)  # Use instance method instead of static method
+        return jsonify({
+            'stations': stations,
+            'count': len(stations),
+            'search_params': search_params
+        }), 200
 
     except Exception as e:
         logger.error(f"Error searching stations: {str(e)}")
@@ -132,45 +136,4 @@ def calculate_charging_route(start_point, destination, ev_model, battery_level):
         'total_duration': 0.0,
         'total_cost': 0.0,
         'energy_consumption': 0.0
-    }
-
-@bp.route('/debug', methods=['GET'])
-def debug():
-    try:
-        # List all tables
-        tables = db.list_tables()
-        print(f"Found tables: {tables}")
-
-        # Test connection to stations table
-        connection_ok = db.test_connection()
-        
-        return jsonify({
-            'tables': tables,
-            'connection_ok': connection_ok
-        }), 200
-    except Exception as e:
-        print(f"Debug error: {str(e)}")
-        return jsonify({'error': str(e)}), 500
-
-@bp.route('/schema', methods=['GET'])
-def get_schema():
-    try:
-        # Get table info
-        table_ref = db.client.dataset(db.dataset).table(db.table)
-        table = db.client.get_table(table_ref)
-        
-        # Get sample data
-        query = f"""
-        SELECT *
-        FROM `{db.dataset}.{db.table}`
-        LIMIT 1
-        """
-        sample = next(db.client.query(query).result())
-        
-        return jsonify({
-            'schema': [{'name': field.name, 'type': field.field_type} for field in table.schema],
-            'sample_row': dict(sample)
-        }), 200
-    except Exception as e:
-        print(f"Schema error: {str(e)}")
-        return jsonify({'error': str(e)}), 500 
+    } 

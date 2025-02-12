@@ -228,6 +228,47 @@ class BigQueryDatabase:
             print(f"Error connecting to table: {str(e)}")
             return False
 
+    def search_stations(self, params):
+        """Search stations with filters"""
+        try:
+            conditions = []
+            query_params = []
+
+            if params.get('operator'):
+                conditions.append("Station_Operator LIKE @operator")
+                query_params.append(
+                    bigquery.ScalarQueryParameter(
+                        "operator", "STRING", f"%{params['operator']}%"
+                    )
+                )
+
+            if params.get('max_cost') is not None:
+                conditions.append("Cost_USD_kWh <= @max_cost")
+                query_params.append(
+                    bigquery.ScalarQueryParameter(
+                        "max_cost", "FLOAT64", float(params['max_cost'])
+                    )
+                )
+
+            # Build the WHERE clause
+            where_clause = " AND ".join(conditions) if conditions else "1=1"
+
+            query = f"""
+            SELECT *
+            FROM `{self.dataset}.{self.table}`
+            WHERE {where_clause}
+            LIMIT 10
+            """
+
+            job_config = bigquery.QueryJobConfig(query_parameters=query_params)
+            results = self.client.query(query, job_config=job_config).result()
+            
+            return [dict(row) for row in results]
+
+        except Exception as e:
+            print(f"Search error: {str(e)}")
+            raise
+
 def load_charging_stations_data(csv_file_path):
     """
     Load charging stations data from CSV to BigQuery
