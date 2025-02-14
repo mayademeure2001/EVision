@@ -4,8 +4,10 @@ from google.cloud import bigquery
 from app.models import User
 from app.config import Config
 from app.database import BigQueryDatabase
+from flask_wtf.csrf import CSRFProtect
 
 login_manager = LoginManager()
+csrf = CSRFProtect()
 
 @login_manager.user_loader
 def load_user(username):
@@ -18,6 +20,10 @@ def create_app(config_class=Config):
     app = Flask(__name__)
     app.config.from_object(config_class)
     app.secret_key = 'dev'  # Change this to a real secret key in production
+    
+    # Disable CSRF protection for development
+    app.config['WTF_CSRF_ENABLED'] = False
+    csrf.init_app(app)
 
     # Initialize BigQuery client
     app.bigquery_client = bigquery.Client(project=app.config['GCP_PROJECT_ID'])
@@ -28,11 +34,9 @@ def create_app(config_class=Config):
 
     # Register blueprints
     from app.auth.routes import bp as auth_bp
-    from app.stations import bp as stations_bp
-    from app.trips import bp as trips_bp
-
+    from app.trips.routes import bp as trips_bp
+    
     app.register_blueprint(auth_bp, url_prefix='/auth')
     app.register_blueprint(trips_bp, url_prefix='/trips')
-    app.register_blueprint(stations_bp, url_prefix='/stations')
 
     return app 
