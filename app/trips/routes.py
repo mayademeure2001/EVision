@@ -9,15 +9,46 @@ bp = Blueprint('trips', __name__)
 logger = logging.getLogger(__name__)
 db = BigQueryDatabase()
 
+VALID_CAR_TYPES = [
+    'Tesla Model 3',
+    'Nissan Leaf',
+    'BMW i4',
+    'Hyundai Ioniq 5',
+    'Ford Mustang Mach-E',
+    'Chevrolet Bolt EV',
+    'Audi e-tron',
+    'Kia EV6',
+    'Porsche Taycan',
+    'Volkswagen ID.4'
+]
+
 @bp.route('/create', methods=['POST'])
 @login_required
 def create_trip():
     try:
         data = request.get_json()
         
-        required_fields = ['start_lat', 'start_lng', 'end_lat', 'end_lng']
+        # Validate required fields
+        required_fields = [
+            'start_lat', 'start_lng', 'end_lat', 'end_lng',
+            'car_type', 'battery_level_start'
+        ]
         if not all(field in data for field in required_fields):
-            return jsonify({'error': 'Missing required coordinates'}), 400
+            return jsonify({'error': 'Missing required fields'}), 400
+
+        # Validate car type
+        if data['car_type'] not in VALID_CAR_TYPES:
+            return jsonify({
+                'error': 'Invalid car type',
+                'valid_cars': VALID_CAR_TYPES
+            }), 400
+
+        # Validate battery level
+        battery_level = float(data['battery_level_start'])
+        if not 0 <= battery_level <= 100:
+            return jsonify({
+                'error': 'Battery level must be between 0 and 100'
+            }), 400
 
         start_coords = (float(data['start_lat']), float(data['start_lng']))
         end_coords = (float(data['end_lat']), float(data['end_lng']))
@@ -25,6 +56,8 @@ def create_trip():
         # Create the trip
         trip = db.create_trip(
             username=current_user.username,
+            car_type=data['car_type'],
+            battery_level_start=battery_level,
             start_coords=start_coords,
             end_coords=end_coords
         )
