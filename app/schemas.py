@@ -1,6 +1,7 @@
 from google.cloud import bigquery
 
 USERS_SCHEMA = [
+    bigquery.SchemaField("user_id", "STRING", mode="REQUIRED"),
     bigquery.SchemaField("username", "STRING", mode="REQUIRED"),
     bigquery.SchemaField("email", "STRING", mode="REQUIRED"),
     bigquery.SchemaField("password_hash", "STRING", mode="REQUIRED"),
@@ -8,9 +9,9 @@ USERS_SCHEMA = [
 ]
 
 TRIPS_SCHEMA = [
-    bigquery.SchemaField("trip_id", "INTEGER"),
-    bigquery.SchemaField("username", "STRING"),
-    bigquery.SchemaField("car_type", "STRING"),
+    bigquery.SchemaField("trip_id", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("user_id", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("car_type", "STRING", mode="REQUIRED"),
     bigquery.SchemaField("battery_level_start", "FLOAT"),
     bigquery.SchemaField("start_lat", "FLOAT"),
     bigquery.SchemaField("start_lng", "FLOAT"),
@@ -25,7 +26,8 @@ TRIPS_SCHEMA = [
 ]
 
 TRIP_STATIONS_SCHEMA = [
-    bigquery.SchemaField("trip_id", "INTEGER"),
+    bigquery.SchemaField("trip_station_id", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("trip_id", "STRING", mode="REQUIRED"),
     bigquery.SchemaField("station_id", "INTEGER"),
     bigquery.SchemaField("name", "STRING"),
     bigquery.SchemaField("latitude", "FLOAT"),

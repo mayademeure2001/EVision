@@ -1,11 +1,13 @@
 from flask import Blueprint, request, jsonify
-from werkzeug.security import generate_password_hash
-from flask_login import login_user, logout_user, login_required
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_login import login_user, logout_user, login_required, current_user
 from app.models import User
 from app.database import BigQueryDatabase
 import logging
+import uuid
+import traceback
+from app.auth import bp
 
-bp = Blueprint('auth', __name__)
 logger = logging.getLogger(__name__)
 db = BigQueryDatabase()
 
@@ -13,21 +15,31 @@ db = BigQueryDatabase()
 def register():
     try:
         data = request.get_json()
-        username = data.get('username')
-        email = data.get('email')
-        password = data.get('password')
-
-        if not all([username, email, password]):
+        logger.info(f"Registration attempt for username: {data.get('username')}")
+        
+        # Check for required fields
+        if not all(k in data for k in ['username', 'email', 'password']):
             return jsonify({'error': 'Missing required fields'}), 400
 
-        existing_user = db.get_user_by_username(username)
-        if existing_user:
+        # Check if username already exists
+        if db.check_username_exists(data['username']):
             return jsonify({'error': 'Username already exists'}), 400
 
-        password_hash = generate_password_hash(password)
-        db.create_user(username, email, password_hash)
+        # Generate UUID for new user
+        user_id = str(uuid.uuid4())
         
-        return jsonify({'message': 'User registered successfully'}), 201
+        # Create user
+        user_data = {
+            'user_id': user_id,
+            'username': data['username'],
+            'email': data['email'],
+            'password_hash': generate_password_hash(data['password'])
+        }
+        
+        db.create_user(user_data)
+        logger.info(f"Successfully registered user: {user_data['username']} with ID: {user_id}")
+        
+        return jsonify({'message': 'Registration successful'}), 201
 
     except Exception as e:
         logger.error(f"Registration error: {str(e)}")
@@ -37,29 +49,42 @@ def register():
 def login():
     try:
         data = request.get_json()
-        username = data.get('username')
-        password = data.get('password')
+        logger.info(f"Login attempt for username: {data.get('username')}")
+        
+        # Check for required fields
+        if not all(k in data for k in ['username', 'password']):
+            logger.error("Missing required fields")
+            return jsonify({'error': 'Missing required fields'}), 400
 
-        if not all([username, password]):
-            return jsonify({'error': 'Missing username or password'}), 400
-
-        user_data = db.get_user_by_username(username)
+        # Get user from database
+        user_data = db.get_user_by_username(data['username'])
         if not user_data:
-            return jsonify({'error': 'Invalid username or password'}), 401
+            logger.error(f"No user found with username: {data.get('username')}")
+            return jsonify({'error': 'Login failed'}), 401
 
+        logger.info(f"Found user: {user_data['username']}")
+
+        # Check password
+        if not check_password_hash(user_data['password_hash'], data['password']):
+            logger.error("Password check failed")
+            return jsonify({'error': 'Login failed'}), 401
+
+        # Create user object and log them in
         user = User(user_data)
-        if not user.check_password(password):
-            return jsonify({'error': 'Invalid username or password'}), 401
-
         login_user(user)
+        logger.info(f"Successfully logged in user: {user.username}")
+
         return jsonify({'message': 'Login successful'}), 200
 
     except Exception as e:
-        logger.error(f"Login error: {str(e)}")
+        logger.error(f"Login error: {str(e)}\n{traceback.format_exc()}")
         return jsonify({'error': 'Login failed'}), 500
 
-@bp.route('/logout')
-@login_required
+@bp.route('/logout', methods=['POST'])
 def logout():
-    logout_user()
-    return jsonify({'message': 'Logged out successfully'}), 200 
+    try:
+        logout_user()
+        return jsonify({'message': 'Logged out successfully'}), 200
+    except Exception as e:
+        logger.error(f"Logout error: {str(e)}")
+        return jsonify({'error': 'Logout failed'}), 500 

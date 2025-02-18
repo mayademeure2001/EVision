@@ -5,9 +5,13 @@ from app.services.charging import ChargingService
 import logging
 import traceback
 import json
+from app.trips import bp
+import uuid
 
-bp = Blueprint('trips', __name__)
+# Set up logger
 logger = logging.getLogger(__name__)
+
+# Create database instance
 db = BigQueryDatabase()
 
 VALID_CAR_TYPES = [
@@ -29,51 +33,26 @@ def create_trip():
     try:
         data = request.get_json()
         
-        # Validate required fields
-        required_fields = [
-            'start_lat', 'start_lng', 'end_lat', 'end_lng',
-            'car_type', 'battery_level_start'
-        ]
-        if not all(field in data for field in required_fields):
+        # Validate input
+        required_fields = ['start_lat', 'start_lng', 'end_lat', 'end_lng', 
+                         'car_type', 'battery_level_start']
+        if not all(k in data for k in required_fields):
             return jsonify({'error': 'Missing required fields'}), 400
-
-        # Validate car type
-        if data['car_type'] not in VALID_CAR_TYPES:
-            return jsonify({
-                'error': 'Invalid car type',
-                'valid_cars': VALID_CAR_TYPES
-            }), 400
-
-        # Validate battery level
-        battery_level = float(data['battery_level_start'])
-        if not 0 <= battery_level <= 100:
-            return jsonify({
-                'error': 'Battery level must be between 0 and 100'
-            }), 400
-
-        start_coords = (float(data['start_lat']), float(data['start_lng']))
-        end_coords = (float(data['end_lat']), float(data['end_lng']))
-
-        # Create the trip (this now includes getting route geometry)
-        trip = db.create_trip(
-            username=current_user.username,
+            
+        # Create trip
+        result = db.create_trip(
+            user_id=current_user.id,
             car_type=data['car_type'],
-            battery_level_start=battery_level,
-            start_coords=start_coords,
-            end_coords=end_coords
+            battery_level_start=data['battery_level_start'],
+            start_coords=(data['start_lat'], data['start_lng']),
+            end_coords=(data['end_lat'], data['end_lng'])
         )
-
-        return jsonify({
-            'message': 'Trip created successfully',
-            'trip': trip,
-        }), 201
-
+        
+        return jsonify(result), 201
+        
     except Exception as e:
-        logger.error(f"Error creating trip: {str(e)}\n{traceback.format_exc()}")
-        return jsonify({
-            'error': 'Failed to create trip',
-            'details': str(e)
-        }), 500
+        logger.error(f"Error creating trip: {str(e)}")
+        return jsonify({'error': 'Failed to create trip'}), 500
 
 @bp.route('/list', methods=['GET'])
 @login_required
