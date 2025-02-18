@@ -8,33 +8,45 @@ class ChargingService:
         self.api_key = api_key or '78796da0-ae35-4cfc-8c3e-550d70f0e7e5'
         self.base_url = base_url or 'https://api.openchargemap.io/v3'
 
-    def find_stations_along_route(self, start_coords, end_coords, radius_km=5):
+    def find_stations_along_route(self, route_geometry, radius_km=5):
         """
         Find charging stations along a route within a specified radius
-        start_coords and end_coords are tuples of (lat, lng)
+        route_geometry: GeoJSON geometry from OSRM response
         """
         try:
-            # Get stations near the route
-            params = {
-                'key': self.api_key,
-                'output': 'json',
-                'maxresults': 10,
-                'compact': True,
-                'verbose': False,
-                'latitude': start_coords[0],
-                'longitude': start_coords[1],
-                'distance': radius_km,
-                'distanceunit': 'km'
-            }
+            # Sample points along the route (every nth point)
+            sample_points = route_geometry['coordinates'][::10]  # Adjust sampling rate as needed
+            
+            all_stations = {}  # Use dict to avoid duplicates
+            
+            for point in sample_points:
+                # OCM expects (lat, lng) but geometry provides (lng, lat)
+                params = {
+                    'key': self.api_key,
+                    'output': 'json',
+                    'maxresults': 10,
+                    'compact': True,
+                    'verbose': False,
+                    'latitude': point[1],    # Convert from lng,lat to lat,lng
+                    'longitude': point[0],
+                    'distance': radius_km,
+                    'distanceunit': 'km'
+                }
 
-            response = requests.get(f"{self.base_url}/poi", params=params)
-            response.raise_for_status()
-            
-            stations = response.json()
-            
-            # Process and format station data
+                response = requests.get(f"{self.base_url}/poi", params=params)
+                response.raise_for_status()
+                
+                stations = response.json()
+                
+                # Add unique stations to our collection
+                for station in stations:
+                    station_id = station.get('ID')
+                    if station_id not in all_stations:
+                        all_stations[station_id] = station
+
+            # Format all found stations
             formatted_stations = []
-            for station in stations:
+            for station in all_stations.values():
                 formatted_stations.append({
                     'id': station.get('ID'),
                     'name': station.get('AddressInfo', {}).get('Title'),

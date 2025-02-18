@@ -4,6 +4,7 @@ from app.database import BigQueryDatabase
 from app.services.charging import ChargingService
 import logging
 import traceback
+import json
 
 bp = Blueprint('trips', __name__)
 logger = logging.getLogger(__name__)
@@ -53,7 +54,7 @@ def create_trip():
         start_coords = (float(data['start_lat']), float(data['start_lng']))
         end_coords = (float(data['end_lat']), float(data['end_lng']))
 
-        # Create the trip
+        # Create the trip (this now includes getting route geometry)
         trip = db.create_trip(
             username=current_user.username,
             car_type=data['car_type'],
@@ -62,26 +63,13 @@ def create_trip():
             end_coords=end_coords
         )
 
-        # Find charging stations
-        charging_service = ChargingService()
-        stations = charging_service.find_stations_along_route(
-            start_coords=start_coords,
-            end_coords=end_coords,
-            radius_km=data.get('charging_radius_km', 5)
-        )
-
-        # Store the stations
-        if stations:
-            db.store_trip_stations(trip['trip_id'], stations)
-
         return jsonify({
             'message': 'Trip created successfully',
             'trip': trip,
-            'charging_stations': stations
         }), 201
 
     except Exception as e:
-        logger.error(f"Error creating trip: {str(e)}")
+        logger.error(f"Error creating trip: {str(e)}\n{traceback.format_exc()}")
         return jsonify({
             'error': 'Failed to create trip',
             'details': str(e)
@@ -92,7 +80,12 @@ def create_trip():
 def list_trips():
     try:
         trips = db.get_user_trips(current_user.username)
-        return jsonify({'trips': trips}), 200
+        # Format the response to include route geometry
+        formatted_trips = [{
+            **trip,
+            'route_geometry': json.loads(trip['route_geometry']) if trip.get('route_geometry') else None
+        } for trip in trips]
+        return jsonify({'trips': formatted_trips}), 200
     except Exception as e:
         logger.error(f"Error listing trips: {str(e)}")
         return jsonify({'error': 'Failed to retrieve trips'}), 500 

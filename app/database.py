@@ -6,6 +6,8 @@ import os
 from app.config import Config
 from werkzeug.security import check_password_hash
 import requests
+import json
+from app.services.charging import ChargingService
 
 logger = logging.getLogger(__name__)
 
@@ -76,99 +78,87 @@ class BigQueryDatabase:
         self.client.query(query, job_config=job_config).result()
 
     def create_trip(self, username, car_type, battery_level_start, start_coords, end_coords):
-        """Create a new trip record with battery calculations"""
-        # Get route from OSRM
-        route_url = f"http://router.project-osrm.org/route/v1/driving/{start_coords[1]},{start_coords[0]};{end_coords[1]},{end_coords[0]}"
-        response = requests.get(route_url)
-        route_data = response.json()
+        try:
+            # 1. Generate a new trip_id
+            query = f"""
+            SELECT COALESCE(MAX(trip_id), 0) + 1 as next_id 
+            FROM `{self.dataset}.{self.trips_table}`
+            """
+            query_job = self.client.query(query)
+            results = query_job.result()
+            trip_id = next(iter(results)).next_id
 
-        if response.status_code != 200 or 'routes' not in route_data:
-            raise Exception("Failed to get route from OSRM")
+            # 2. Get route from OSRM with geometry
+            route_url = f"{self.osrm_base_url}{start_coords[1]},{start_coords[0]};{end_coords[1]},{end_coords[0]}?geometries=geojson&overview=full"
+            response = requests.get(route_url)
+            response.raise_for_status()
+            
+            route_data = response.json()
+            route = route_data['routes'][0]
+            route_geometry = route['geometry']
 
-        route = route_data['routes'][0]
-        
-        # Calculate average speed in km/h
-        distance_km = route['distance'] / 1000
-        duration_hours = route['duration'] / 3600
-        average_speed_kph = distance_km / duration_hours if duration_hours > 0 else 0
+            # 3. Calculate trip metrics
+            distance_meters = route['distance']
+            duration_seconds = route['duration']
+            average_speed_kph = (distance_meters / 1000) / (duration_seconds / 3600)
 
-        # Round speed to nearest 10 for battery calculation
-        rounded_speed = round(average_speed_kph / 10) * 10
-        # Clamp speed between 30 and 150
-        rounded_speed = max(30, min(150, rounded_speed))
-        
-        # Get battery duration from car_battery_speed table
-        battery_query = f"""
-        SELECT Time_at_{rounded_speed}_km_h_hours * {battery_level_start/100.0} as battery_duration_hours
-        FROM `{self.dataset}.car_battery_speed`
-        WHERE Car_Brand = @car_type
-        """
-        
-        battery_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("car_type", "STRING", car_type)
-            ]
-        )
-        
-        battery_result = self.client.query(battery_query, job_config=battery_config).result()
-        battery_duration_hours = list(battery_result)[0]['battery_duration_hours']
-        battery_duration_seconds = int(battery_duration_hours * 3600)
+            # 4. Insert the trip
+            query = f"""
+            INSERT INTO `{self.dataset}.{self.trips_table}`
+            (trip_id, username, car_type, battery_level_start, 
+             start_lat, start_lng, end_lat, end_lng,
+             start_date, duration_seconds, distance_meters, 
+             average_speed_kph, estimated_duration_battery_seconds,
+             route_geometry)
+            VALUES
+            (@trip_id, @username, @car_type, @battery_level, 
+             @start_lat, @start_lng, @end_lat, @end_lng,
+             CURRENT_TIMESTAMP(), @duration, @distance, 
+             @speed, @battery_duration, @geometry)
+            """
+            
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("trip_id", "INTEGER", trip_id),
+                    bigquery.ScalarQueryParameter("username", "STRING", username),
+                    bigquery.ScalarQueryParameter("car_type", "STRING", car_type),
+                    bigquery.ScalarQueryParameter("battery_level", "FLOAT64", battery_level_start),
+                    bigquery.ScalarQueryParameter("start_lat", "FLOAT64", start_coords[0]),
+                    bigquery.ScalarQueryParameter("start_lng", "FLOAT64", start_coords[1]),
+                    bigquery.ScalarQueryParameter("end_lat", "FLOAT64", end_coords[0]),
+                    bigquery.ScalarQueryParameter("end_lng", "FLOAT64", end_coords[1]),
+                    bigquery.ScalarQueryParameter("duration", "INTEGER", int(duration_seconds)),
+                    bigquery.ScalarQueryParameter("distance", "FLOAT64", distance_meters),
+                    bigquery.ScalarQueryParameter("speed", "FLOAT64", average_speed_kph),
+                    bigquery.ScalarQueryParameter("battery_duration", "INTEGER", int(duration_seconds * 1.2)),
+                    bigquery.ScalarQueryParameter("geometry", "STRING", json.dumps(route_geometry))
+                ]
+            )
 
-        # Get the next trip_id
-        id_query = f"""
-        SELECT COALESCE(MAX(trip_id), 0) + 1 as next_id
-        FROM `{self.dataset}.{self.trips_table}`
-        """
-        id_job = self.client.query(id_query)
-        next_id = list(id_job.result())[0]['next_id']
+            # Execute query
+            query_job = self.client.query(query, job_config=job_config)
+            query_job.result()
 
-        query = f"""
-        INSERT INTO `{self.dataset}.{self.trips_table}`
-        (trip_id, user_name, car_type, battery_level_start, 
-         start_latitude, start_longitude, end_latitude, end_longitude,
-         start_timestamp, duration_seconds, distance_meters, 
-         average_speed_kph, estimated_duration_battery_seconds)
-        VALUES
-        (@trip_id, @username, @car_type, @battery_level, 
-         @start_lat, @start_lng, @end_lat, @end_lng,
-         CURRENT_TIMESTAMP(), @duration, @distance, 
-         @speed, @battery_duration)
-        """
-        
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("trip_id", "INTEGER", next_id),
-                bigquery.ScalarQueryParameter("username", "STRING", username),
-                bigquery.ScalarQueryParameter("car_type", "STRING", car_type),
-                bigquery.ScalarQueryParameter("battery_level", "FLOAT64", battery_level_start),
-                bigquery.ScalarQueryParameter("start_lat", "FLOAT64", start_coords[0]),
-                bigquery.ScalarQueryParameter("start_lng", "FLOAT64", start_coords[1]),
-                bigquery.ScalarQueryParameter("end_lat", "FLOAT64", end_coords[0]),
-                bigquery.ScalarQueryParameter("end_lng", "FLOAT64", end_coords[1]),
-                bigquery.ScalarQueryParameter("duration", "INTEGER", int(route['duration'])),
-                bigquery.ScalarQueryParameter("distance", "FLOAT64", route['distance']),
-                bigquery.ScalarQueryParameter("speed", "FLOAT64", average_speed_kph),
-                bigquery.ScalarQueryParameter("battery_duration", "INTEGER", battery_duration_seconds)
-            ]
-        )
-        
-        query_job = self.client.query(query, job_config=job_config)
-        query_job.result()
+            # 5. Find and store charging stations
+            charging_service = ChargingService()
+            stations = charging_service.find_stations_along_route(route_geometry)
 
-        return {
-            'trip_id': next_id,
-            'username': username,
-            'car_type': car_type,
-            'battery_level': battery_level_start,
-            'start_lat': start_coords[0],
-            'start_lng': start_coords[1],
-            'end_lat': end_coords[0],
-            'end_lng': end_coords[1],
-            'duration': f"{int(route['duration'] / 60)} minutes",
-            'distance': f"{distance_km:.1f} km",
-            'average_speed': f"{average_speed_kph:.1f} km/h",
-            'battery_duration': f"{battery_duration_hours:.1f} hours"
-        }
+            if stations:
+                self.store_trip_stations(trip_id, stations)
+
+            return {
+                'trip_id': trip_id,
+                'route': {
+                    'distance': distance_meters,
+                    'duration': duration_seconds,
+                    'geometry': route_geometry
+                },
+                'stations': stations
+            }
+
+        except Exception as e:
+            logger.error(f"Error creating trip: {str(e)}")
+            raise
 
     def get_user_trips(self, username):
         """Get all trips for a specific user"""
