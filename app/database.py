@@ -79,38 +79,58 @@ class BigQueryDatabase:
 
     def create_trip(self, user_id, car_type, battery_level_start, start_coords, end_coords):
         try:
-            # Generate UUID for new trip
             trip_id = str(uuid.uuid4())
-            logger.info(f"Creating trip with ID: {trip_id}")
             
             # Get route from OSRM
             route_url = f"{self.osrm_base_url}{start_coords[1]},{start_coords[0]};{end_coords[1]},{end_coords[0]}?geometries=geojson&overview=full"
-            logger.info(f"Calling OSRM with URL: {route_url}")
-            
             response = requests.get(route_url)
             route_data = response.json()
             
-            logger.info(f"OSRM Response: {route_data}")
-            
             if response.status_code != 200 or 'routes' not in route_data or not route_data['routes']:
                 raise Exception("Failed to get route from OSRM")
-            
+                
             route = route_data['routes'][0]
             
-            # Find charging stations
-            stations = self.find_charging_stations_along_route(route['geometry'])
-            logger.info(f"Found {len(stations)} stations")
+            # Calculate average speed and round to nearest 10
+            average_speed_kph = (route['distance']/1000)/(route['duration']/3600)
+            rounded_speed = round(average_speed_kph/10) * 10
+            rounded_speed = max(30, min(150, rounded_speed))
+            
+            # Get battery duration from car_battery_speed table
+            speed_column = f"Time_at_{rounded_speed}_km_h_hours"
+            battery_query = f"""
+            SELECT {speed_column}
+            FROM `{self.dataset}.{Config.BQ_CAR_BATTERY_TABLE}`
+            WHERE Car_Brand = @car_type
+            """
+            
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("car_type", "STRING", car_type)
+                ]
+            )
+            
+            query_job = self.client.query(battery_query, job_config=job_config)
+            result = next(query_job.result())
+            battery_duration_hours = result[speed_column]
+            
+            # Calculate estimated duration based on battery level percentage
+            estimated_duration_battery = int(battery_duration_hours * 3600 * (battery_level_start/100))
             
             # Store trip in BigQuery
             query = f"""
-            INSERT INTO `{self.dataset}.{self.trips_table}`
-            (trip_id, user_id, car_type, battery_level_start, start_lat, start_lng, 
-             end_lat, end_lng, start_date, duration_seconds, distance_meters, 
-             average_speed_kph, estimated_duration_battery_seconds, route_geometry)
+            INSERT INTO `{self.dataset}.{Config.BQ_TRIPS_TABLE}`
+            (trip_id, user_id, car_type, battery_level_start, 
+             start_lat, start_lng, end_lat, end_lng,
+             start_date, duration_seconds, distance_meters, 
+             average_speed_kph, estimated_duration_battery_seconds, 
+             route_geometry)
             VALUES
-            (@trip_id, @user_id, @car_type, @battery_level_start, @start_lat, @start_lng,
-             @end_lat, @end_lng, CURRENT_TIMESTAMP(), @duration_seconds, @distance_meters,
-             @average_speed_kph, @estimated_duration_battery, @route_geometry)
+            (@trip_id, @user_id, @car_type, @battery_level_start,
+             @start_lat, @start_lng, @end_lat, @end_lng,
+             CURRENT_TIMESTAMP(), @duration_seconds, @distance_meters,
+             @average_speed_kph, @estimated_duration_battery_seconds,
+             @route_geometry)
             """
             
             params = [
@@ -124,44 +144,19 @@ class BigQueryDatabase:
                 bigquery.ScalarQueryParameter("end_lng", "FLOAT64", end_coords[1]),
                 bigquery.ScalarQueryParameter("duration_seconds", "INTEGER", int(route['duration'])),
                 bigquery.ScalarQueryParameter("distance_meters", "FLOAT64", route['distance']),
-                bigquery.ScalarQueryParameter("average_speed_kph", "FLOAT64", (route['distance']/1000)/(route['duration']/3600)),
-                bigquery.ScalarQueryParameter("estimated_duration_battery", "INTEGER", int(route['duration'] * 1.2)),
+                bigquery.ScalarQueryParameter("average_speed_kph", "FLOAT64", average_speed_kph),
+                bigquery.ScalarQueryParameter("estimated_duration_battery_seconds", "INTEGER", estimated_duration_battery),
                 bigquery.ScalarQueryParameter("route_geometry", "STRING", json.dumps(route['geometry']))
             ]
             
-            logger.info("Executing trip insert query")
             job_config = bigquery.QueryJobConfig(query_parameters=params)
             self.client.query(query, job_config=job_config).result()
             
-            # Store stations
-            for station in stations:
-                station_id = str(uuid.uuid4())
-                station_query = f"""
-                INSERT INTO `{self.dataset}.{self.trip_stations_table}`
-                (trip_station_id, trip_id, station_id, name, latitude, longitude, 
-                 address, distance_km, connection_types, power_kw, status)
-                VALUES
-                (@station_id, @trip_id, @ocm_id, @name, @lat, @lng, 
-                 @address, @distance, @connections, @power, @status)
-                """
-                
-                station_params = [
-                    bigquery.ScalarQueryParameter("station_id", "STRING", station_id),
-                    bigquery.ScalarQueryParameter("trip_id", "STRING", trip_id),
-                    bigquery.ScalarQueryParameter("ocm_id", "INTEGER", station['id']),
-                    bigquery.ScalarQueryParameter("name", "STRING", station['name']),
-                    bigquery.ScalarQueryParameter("lat", "FLOAT64", station['latitude']),
-                    bigquery.ScalarQueryParameter("lng", "FLOAT64", station['longitude']),
-                    bigquery.ScalarQueryParameter("address", "STRING", station['address']),
-                    bigquery.ScalarQueryParameter("distance", "FLOAT64", station['distance_km']),
-                    bigquery.ScalarQueryParameter("connections", "STRING", json.dumps(station['connections'])),
-                    bigquery.ScalarQueryParameter("power", "FLOAT64", station['max_power']),
-                    bigquery.ScalarQueryParameter("status", "STRING", station['status'])
-                ]
-                
-                logger.info(f"Storing station {station_id}")
-                job_config = bigquery.QueryJobConfig(query_parameters=station_params)
-                self.client.query(station_query, job_config=job_config).result()
+            # Find and store charging stations
+            stations = self.find_charging_stations_along_route(route['geometry'])
+            
+            # Add this line to actually store the stations
+            self.store_trip_stations(trip_id, stations)
             
             return {
                 'trip_id': trip_id,
@@ -172,10 +167,9 @@ class BigQueryDatabase:
                 },
                 'stations': stations
             }
-
+            
         except Exception as e:
             logger.error(f"Error creating trip: {str(e)}")
-            logger.error(traceback.format_exc())
             raise
 
     def get_user_trips(self, username):
@@ -376,29 +370,39 @@ class BigQueryDatabase:
     def store_trip_stations(self, trip_id, stations):
         """Store charging stations found for a specific trip"""
         if not stations:
+            logger.info("No stations to store")
             return
         
         rows_to_insert = []
-        for station in stations:
+        for idx, station in enumerate(stations):
+            if not station:  # Skip if station is None
+                continue
+            
             for connection in station.get('connections', []):
-                rows_to_insert.append({
-                    'trip_id': trip_id,
-                    'station_id': station.get('id'),
-                    'name': station.get('name'),
-                    'latitude': station.get('latitude'),
-                    'longitude': station.get('longitude'),
-                    'address': station.get('address'),
-                    'distance_km': station.get('distance_km'),
-                    'connection_types': connection.get('type'),
-                    'power_kw': connection.get('power_kw'),
-                    'status': connection.get('status')
-                })
+                trip_station_id = f"{trip_id}_{station['id']}_{idx}"
+                try:
+                    rows_to_insert.append({
+                        'trip_station_id': trip_station_id,
+                        'trip_id': trip_id,
+                        'station_id': int(station['id']),
+                        'name': station['name'][:100],  # Limit string length
+                        'latitude': float(station['latitude']),
+                        'longitude': float(station['longitude']),
+                        'address': station['address'][:200] if station['address'] else 'No Address',  # Limit string length and provide default
+                        'distance_km': float(station['distance_km']),
+                        'connection_types': connection['type'][:50],  # Limit string length
+                        'power_kw': float(connection['power_kw']),
+                        'status': connection['status'][:50]  # Limit string length
+                    })
+                except (ValueError, KeyError) as e:
+                    logger.error(f"Error processing station {trip_station_id}: {str(e)}")
+                    continue
 
         if rows_to_insert:
             query = f"""
             INSERT INTO `{self.dataset}.{self.trip_stations_table}`
-            (trip_id, station_id, name, latitude, longitude, address, 
-             distance_km, connection_types, power_kw, status)
+            (trip_station_id, trip_id, station_id, name, latitude, longitude, 
+             address, distance_km, connection_types, power_kw, status)
             VALUES
             """
             value_parts = []
@@ -409,26 +413,32 @@ class BigQueryDatabase:
                 value_parts.append(f"""(
                     @p{param_num}, @p{param_num+1}, @p{param_num+2}, @p{param_num+3}, 
                     @p{param_num+4}, @p{param_num+5}, @p{param_num+6}, @p{param_num+7}, 
-                    @p{param_num+8}, @p{param_num+9}
+                    @p{param_num+8}, @p{param_num+9}, @p{param_num+10}
                 )""")
                 params.extend([
-                    bigquery.ScalarQueryParameter(f"p{param_num}", "STRING", row['trip_id']),
-                    bigquery.ScalarQueryParameter(f"p{param_num+1}", "STRING", row['station_id']),
-                    bigquery.ScalarQueryParameter(f"p{param_num+2}", "STRING", row['name']),
-                    bigquery.ScalarQueryParameter(f"p{param_num+3}", "FLOAT64", row['latitude']),
-                    bigquery.ScalarQueryParameter(f"p{param_num+4}", "FLOAT64", row['longitude']),
-                    bigquery.ScalarQueryParameter(f"p{param_num+5}", "STRING", row['address']),
-                    bigquery.ScalarQueryParameter(f"p{param_num+6}", "FLOAT64", row['distance_km']),
-                    bigquery.ScalarQueryParameter(f"p{param_num+7}", "STRING", row['connection_types']),
-                    bigquery.ScalarQueryParameter(f"p{param_num+8}", "FLOAT64", row['power_kw']),
-                    bigquery.ScalarQueryParameter(f"p{param_num+9}", "STRING", row['status'])
+                    bigquery.ScalarQueryParameter(f"p{param_num}", "STRING", row['trip_station_id']),
+                    bigquery.ScalarQueryParameter(f"p{param_num+1}", "STRING", row['trip_id']),
+                    bigquery.ScalarQueryParameter(f"p{param_num+2}", "INTEGER", row['station_id']),
+                    bigquery.ScalarQueryParameter(f"p{param_num+3}", "STRING", row['name']),
+                    bigquery.ScalarQueryParameter(f"p{param_num+4}", "FLOAT64", row['latitude']),
+                    bigquery.ScalarQueryParameter(f"p{param_num+5}", "FLOAT64", row['longitude']),
+                    bigquery.ScalarQueryParameter(f"p{param_num+6}", "STRING", row['address']),
+                    bigquery.ScalarQueryParameter(f"p{param_num+7}", "FLOAT64", row['distance_km']),
+                    bigquery.ScalarQueryParameter(f"p{param_num+8}", "STRING", row['connection_types']),
+                    bigquery.ScalarQueryParameter(f"p{param_num+9}", "FLOAT64", row['power_kw']),
+                    bigquery.ScalarQueryParameter(f"p{param_num+10}", "STRING", row['status'])
                 ])
-                param_num += 10
+                param_num += 11
 
             query += ",".join(value_parts)
             
-            job_config = bigquery.QueryJobConfig(query_parameters=params)
-            self.client.query(query, job_config=job_config).result()
+            try:
+                job_config = bigquery.QueryJobConfig(query_parameters=params)
+                self.client.query(query, job_config=job_config).result()
+                logger.info(f"Successfully stored {len(rows_to_insert)} stations")
+            except Exception as e:
+                logger.error(f"Error storing stations: {str(e)}")
+                raise
 
     def check_username_exists(self, username):
         query = f"""
@@ -523,24 +533,33 @@ class BigQueryDatabase:
     def _process_station(self, station):
         """Helper method to process a single station"""
         try:
+            # Add default values for required fields
             station_info = {
-                'id': station['ID'],
+                'id': station.get('ID', 0),  # Default to 0 if no ID
                 'name': station.get('AddressInfo', {}).get('Title', 'Unknown Station'),
-                'latitude': station.get('AddressInfo', {}).get('Latitude'),
-                'longitude': station.get('AddressInfo', {}).get('Longitude'),
-                'address': station.get('AddressInfo', {}).get('AddressLine1', ''),
-                'distance_km': station.get('AddressInfo', {}).get('Distance', 0),
-                'connections': [
-                    {
+                'latitude': station.get('AddressInfo', {}).get('Latitude', 0.0),
+                'longitude': station.get('AddressInfo', {}).get('Longitude', 0.0),
+                'address': station.get('AddressInfo', {}).get('AddressLine1', 'No Address'),  # Default address
+                'distance_km': station.get('AddressInfo', {}).get('Distance', 0.0),
+                'connections': []
+            }
+            
+            # Process connections if they exist
+            if station.get('Connections'):
+                for conn in station['Connections']:
+                    connection = {
                         'type': conn.get('ConnectionType', {}).get('Title', 'Unknown'),
-                        'power_kw': conn.get('PowerKW', 0),
+                        'power_kw': float(conn.get('PowerKW', 0.0)),  # Convert to float with default
                         'status': conn.get('StatusType', {}).get('Title', 'Unknown')
                     }
-                    for conn in station.get('Connections', [])
-                ],
-                'max_power': max([conn.get('PowerKW', 0) for conn in station.get('Connections', [])], default=0),
-                'status': 'Available'
-            }
+                    station_info['connections'].append(connection)
+            else:
+                # Add a default connection if none exists
+                station_info['connections'].append({
+                    'type': 'Unknown',
+                    'power_kw': 0.0,
+                    'status': 'Unknown'
+                })
             
             if all(v is not None for v in [station_info['latitude'], station_info['longitude']]):
                 return station_info

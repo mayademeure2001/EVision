@@ -15,3 +15,9 @@ class Config:
     
     # OSRM Config
     OSRM_BASE_URL = "http://router.project-osrm.org/route/v1/driving/" 
+    
+    # Add table names
+    BQ_USERS_TABLE = 'users'
+    BQ_TRIPS_TABLE = 'trips'
+    BQ_TRIP_STATIONS_TABLE = 'trip_stations'
+    BQ_CAR_BATTERY_TABLE = 'car_battery_speed' 
