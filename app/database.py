@@ -91,17 +91,15 @@ class BigQueryDatabase:
                 
             route = route_data['routes'][0]
             
-            # Calculate average speed and round to nearest 10
+            # Calculate average speed
             average_speed_kph = (route['distance']/1000)/(route['duration']/3600)
-            rounded_speed = round(average_speed_kph/10) * 10
-            rounded_speed = max(30, min(150, rounded_speed))
             
-            # Get battery duration from car_battery_speed table
-            speed_column = f"Time_at_{rounded_speed}_km_h_hours"
-            battery_query = f"""
-            SELECT {speed_column}
-            FROM `{self.dataset}.{Config.BQ_CAR_BATTERY_TABLE}`
-            WHERE Car_Brand = @car_type
+            # Get vehicle efficiency parameters and battery capacity from car_energy_costs table
+            query = f"""
+            SELECT A, B, C, CostPer_kWh_Dollars, BatteryCapacity_kWh
+            FROM `{self.dataset}.car_energy_costs`
+            WHERE Vehicle = @car_type
+            LIMIT 1
             """
             
             job_config = bigquery.QueryJobConfig(
@@ -110,12 +108,25 @@ class BigQueryDatabase:
                 ]
             )
             
-            query_job = self.client.query(battery_query, job_config=job_config)
-            result = next(query_job.result())
-            battery_duration_hours = result[speed_column]
+            results = self.client.query(query, job_config=job_config).result()
+            vehicle_data = next(iter(results), None)
             
-            # Calculate estimated duration based on battery level percentage
-            estimated_duration_battery = int(battery_duration_hours * 3600 * (battery_level_start/100))
+            if not vehicle_data:
+                raise Exception(f"No efficiency data found for vehicle type: {car_type}")
+                
+            # Calculate efficiency (Wh/km)
+            efficiency = (vehicle_data['A'] + 
+                         vehicle_data['B'] * average_speed_kph + 
+                         vehicle_data['C'] * (average_speed_kph ** 2))
+            
+            # Calculate energy used (kWh)
+            energy_used = (route['distance'] / 1000) * (efficiency / 1000)
+            
+            # Calculate cost
+            cost = energy_used * vehicle_data['CostPer_kWh_Dollars']
+            
+            # Calculate start battery capacity in kWh
+            start_battery_capacity = (battery_level_start / 100) * vehicle_data['BatteryCapacity_kWh']
             
             # Store trip in BigQuery
             query = f"""
@@ -123,14 +134,14 @@ class BigQueryDatabase:
             (trip_id, user_id, car_type, battery_level_start, 
              start_lat, start_lng, end_lat, end_lng,
              start_date, duration_seconds, distance_meters, 
-             average_speed_kph, estimated_duration_battery_seconds, 
-             route_geometry)
+             average_speed_kph, route_geometry, energy_used_kWh,
+             cost_dollars, start_battery_capacity_kWh)
             VALUES
             (@trip_id, @user_id, @car_type, @battery_level_start,
              @start_lat, @start_lng, @end_lat, @end_lng,
              CURRENT_TIMESTAMP(), @duration_seconds, @distance_meters,
-             @average_speed_kph, @estimated_duration_battery_seconds,
-             @route_geometry)
+             @average_speed_kph, @route_geometry, @energy_used_kWh,
+             @cost_dollars, @start_battery_capacity_kWh)
             """
             
             params = [
@@ -145,8 +156,10 @@ class BigQueryDatabase:
                 bigquery.ScalarQueryParameter("duration_seconds", "INTEGER", int(route['duration'])),
                 bigquery.ScalarQueryParameter("distance_meters", "FLOAT64", route['distance']),
                 bigquery.ScalarQueryParameter("average_speed_kph", "FLOAT64", average_speed_kph),
-                bigquery.ScalarQueryParameter("estimated_duration_battery_seconds", "INTEGER", estimated_duration_battery),
-                bigquery.ScalarQueryParameter("route_geometry", "STRING", json.dumps(route['geometry']))
+                bigquery.ScalarQueryParameter("route_geometry", "STRING", json.dumps(route['geometry'])),
+                bigquery.ScalarQueryParameter("energy_used_kWh", "FLOAT64", energy_used),
+                bigquery.ScalarQueryParameter("cost_dollars", "FLOAT64", cost),
+                bigquery.ScalarQueryParameter("start_battery_capacity_kWh", "FLOAT64", start_battery_capacity)
             ]
             
             job_config = bigquery.QueryJobConfig(query_parameters=params)
@@ -154,8 +167,6 @@ class BigQueryDatabase:
             
             # Find and store charging stations
             stations = self.find_charging_stations_along_route(route['geometry'])
-            
-            # Add this line to actually store the stations
             self.store_trip_stations(trip_id, stations)
             
             return {
@@ -164,6 +175,11 @@ class BigQueryDatabase:
                     'distance': route['distance'],
                     'duration': route['duration'],
                     'geometry': route['geometry']
+                },
+                'energy': {
+                    'used_kWh': energy_used,
+                    'cost_dollars': cost,
+                    'start_battery_capacity_kWh': start_battery_capacity
                 },
                 'stations': stations
             }
@@ -568,6 +584,87 @@ class BigQueryDatabase:
         except Exception as e:
             logger.error(f"Error processing station data: {str(e)}")
             return None
+
+    def search_trips(self, filters=None):
+        """
+        Search trips with various filters
+        filters can include:
+        - car_types: list of car types
+        - user_id: string
+        - min_duration, max_duration: in seconds
+        - min_distance, max_distance: in meters
+        - min_speed, max_speed: in kph
+        - min_energy, max_energy: in kWh
+        - min_cost, max_cost: in dollars
+        """
+        try:
+            conditions = []
+            params = []
+            param_count = 0
+
+            if filters:
+                if filters.get('car_types'):
+                    car_types = filters['car_types']
+                    placeholders = [f'@car_type_{i}' for i in range(len(car_types))]
+                    conditions.append(f"car_type IN ({','.join(placeholders)})")
+                    for i, car_type in enumerate(car_types):
+                        params.append(bigquery.ScalarQueryParameter(f"car_type_{i}", "STRING", car_type))
+
+                if filters.get('user_id'):
+                    conditions.append("user_id = @user_id")
+                    params.append(bigquery.ScalarQueryParameter("user_id", "STRING", filters['user_id']))
+
+                if filters.get('min_duration'):
+                    conditions.append("duration_seconds >= @min_duration")
+                    params.append(bigquery.ScalarQueryParameter("min_duration", "INTEGER", filters['min_duration']))
+                if filters.get('max_duration'):
+                    conditions.append("duration_seconds <= @max_duration")
+                    params.append(bigquery.ScalarQueryParameter("max_duration", "INTEGER", filters['max_duration']))
+
+                if filters.get('min_distance'):
+                    conditions.append("distance_meters >= @min_distance")
+                    params.append(bigquery.ScalarQueryParameter("min_distance", "FLOAT64", filters['min_distance']))
+                if filters.get('max_distance'):
+                    conditions.append("distance_meters <= @max_distance")
+                    params.append(bigquery.ScalarQueryParameter("max_distance", "FLOAT64", filters['max_distance']))
+
+                if filters.get('min_speed'):
+                    conditions.append("average_speed_kph >= @min_speed")
+                    params.append(bigquery.ScalarQueryParameter("min_speed", "FLOAT64", filters['min_speed']))
+                if filters.get('max_speed'):
+                    conditions.append("average_speed_kph <= @max_speed")
+                    params.append(bigquery.ScalarQueryParameter("max_speed", "FLOAT64", filters['max_speed']))
+
+                if filters.get('min_energy'):
+                    conditions.append("energy_used_kWh >= @min_energy")
+                    params.append(bigquery.ScalarQueryParameter("min_energy", "FLOAT64", filters['min_energy']))
+                if filters.get('max_energy'):
+                    conditions.append("energy_used_kWh <= @max_energy")
+                    params.append(bigquery.ScalarQueryParameter("max_energy", "FLOAT64", filters['max_energy']))
+
+                if filters.get('min_cost'):
+                    conditions.append("cost_dollars >= @min_cost")
+                    params.append(bigquery.ScalarQueryParameter("min_cost", "FLOAT64", filters['min_cost']))
+                if filters.get('max_cost'):
+                    conditions.append("cost_dollars <= @max_cost")
+                    params.append(bigquery.ScalarQueryParameter("max_cost", "FLOAT64", filters['max_cost']))
+
+            # Build the query
+            query = f"""
+            SELECT *
+            FROM `{self.dataset}.{Config.BQ_TRIPS_TABLE}`
+            {f"WHERE {' AND '.join(conditions)}" if conditions else ""}
+            ORDER BY start_date DESC
+            """
+
+            job_config = bigquery.QueryJobConfig(query_parameters=params)
+            results = self.client.query(query, job_config=job_config).result()
+            
+            return [dict(row) for row in results]
+
+        except Exception as e:
+            logger.error(f"Error searching trips: {str(e)}")
+            raise
 
 def load_charging_stations_data(csv_file_path):
     """
